@@ -375,6 +375,48 @@ def test_flags_an_invalid_ossie_sql_2026_expression() -> None:
     assert error.startswith("[SQL] ctx:")
 
 
+def _parse_ossie_sql(expression: str):
+    """Parse *expression* the way the validator parses an OSSIE_SQL_2026 body."""
+    return _VALIDATE.sqlglot.parse_one(
+        expression, dialect=_VALIDATE.DIALECT_MAP["OSSIE_SQL_2026"]
+    )
+
+
+@pytest.mark.skipif(not _VALIDATE.SQLGLOT_AVAILABLE, reason="sqlglot is not installed")
+def test_not_binds_looser_than_comparison() -> None:
+    """`NOT a = b` is `NOT (a = b)`, the rank expression_language.md gives NOT.
+
+    Listing NOT among the unary operators would instead read it as `(NOT a) = b`,
+    which negates a before comparing it and is a different expression. Pinned so
+    the precedence table and the parser behind it cannot drift apart.
+    """
+    exp = _VALIDATE.sqlglot.exp
+    tree = _parse_ossie_sql("NOT a = b")
+
+    assert isinstance(tree, exp.Not)
+    assert isinstance(tree.this, exp.EQ)
+
+
+@pytest.mark.skipif(not _VALIDATE.SQLGLOT_AVAILABLE, reason="sqlglot is not installed")
+def test_unary_minus_binds_tighter_than_comparison() -> None:
+    """`- a = b` is `(-a) = b`: the operators NOT was listed beside do bind first."""
+    exp = _VALIDATE.sqlglot.exp
+    tree = _parse_ossie_sql("- a = b")
+
+    assert isinstance(tree, exp.EQ)
+    assert isinstance(tree.this, exp.Neg)
+
+
+@pytest.mark.skipif(not _VALIDATE.SQLGLOT_AVAILABLE, reason="sqlglot is not installed")
+def test_not_binds_tighter_than_and() -> None:
+    """`NOT a AND b` is `(NOT a) AND b`, placing NOT above AND rather than below."""
+    exp = _VALIDATE.sqlglot.exp
+    tree = _parse_ossie_sql("NOT a AND b")
+
+    assert isinstance(tree, exp.And)
+    assert isinstance(tree.this, exp.Not)
+
+
 @pytest.mark.skipif(not _VALIDATE.SQLGLOT_AVAILABLE, reason="sqlglot is not installed")
 @pytest.mark.parametrize(
     "expression",
@@ -1171,3 +1213,127 @@ def test_validate_document_runs_semantic_checks_on_a_valid_shape(core_schema, of
     errors = _VALIDATE.validate_document(_document([_CUSTOMERS, _CUSTOMERS], []), core_schema)
 
     assert any(error.startswith("[Unique]") for error in errors)
+
+
+# ---------------------------------------------------------------------------
+# Dataset-scoped metrics: field/metric name uniqueness and single-part scoping.
+# ---------------------------------------------------------------------------
+
+
+def _ds_expr(sql: str, dialect: str = "OSSIE_SQL_2026") -> dict:
+    return {"dialects": [{"dialect": dialect, "expression": sql}]}
+
+
+def _orders_with(fields=None, metrics=None) -> dict:
+    dataset = {"name": "orders", "source": "db.s.orders"}
+    if fields is not None:
+        dataset["fields"] = fields
+    if metrics is not None:
+        dataset["metrics"] = metrics
+    return _document([dataset, _CUSTOMERS], [])
+
+
+def test_dataset_scoped_metric_name_may_not_collide_with_a_field() -> None:
+    doc = _orders_with(
+        fields=[{"name": "amount", "expression": _ds_expr("amount")}],
+        metrics=[{"name": "amount", "expression": _ds_expr("SUM(amount)")}],
+    )
+
+    errors = _VALIDATE.validate_unique_names(doc)
+
+    assert any("used by both a field" in error for error in errors)
+
+
+def test_duplicate_dataset_scoped_metric_names_are_rejected() -> None:
+    doc = _orders_with(
+        metrics=[
+            {"name": "total", "expression": _ds_expr("SUM(amount)")},
+            {"name": "total", "expression": _ds_expr("COUNT(amount)")},
+        ],
+    )
+
+    errors = _VALIDATE.validate_unique_names(doc)
+
+    assert any("Duplicate metric name 'total' in dataset 'orders'" in error for error in errors)
+
+
+def test_field_and_dataset_metric_with_distinct_names_are_unique() -> None:
+    doc = _orders_with(
+        fields=[{"name": "amount", "expression": _ds_expr("amount")}],
+        metrics=[{"name": "total_amount", "expression": _ds_expr("SUM(amount)")}],
+    )
+
+    assert _VALIDATE.validate_unique_names(doc) == []
+
+
+def test_dataset_scoped_metric_accepts_single_part_declared_field() -> None:
+    doc = _orders_with(
+        fields=[{"name": "amount", "expression": _ds_expr("amount")}],
+        metrics=[{"name": "total_amount", "expression": _ds_expr("SUM(amount)")}],
+    )
+
+    assert _VALIDATE.validate_metric_scoping(doc) == []
+
+
+def test_dataset_scoped_metric_rejects_a_self_qualified_reference() -> None:
+    doc = _orders_with(
+        metrics=[{"name": "total_amount", "expression": _ds_expr("SUM(orders.amount)")}],
+    )
+
+    errors = _VALIDATE.validate_metric_scoping(doc)
+
+    assert any(error.startswith("[Scope]") and "'orders'" in error for error in errors)
+
+
+def test_dataset_scoped_metric_rejects_a_cross_dataset_reference() -> None:
+    doc = _orders_with(
+        fields=[{"name": "amount", "expression": _ds_expr("amount")}],
+        metrics=[{"name": "bad", "expression": _ds_expr("SUM(amount) / COUNT(customers.id)")}],
+    )
+
+    errors = _VALIDATE.validate_metric_scoping(doc)
+
+    assert any(error.startswith("[Scope]") and "'customers'" in error for error in errors)
+
+
+def test_dataset_scoped_metric_rejects_an_undeclared_field() -> None:
+    doc = _orders_with(
+        fields=[{"name": "amount", "expression": _ds_expr("amount")}],
+        metrics=[{"name": "total_qty", "expression": _ds_expr("SUM(quantity)")}],
+    )
+
+    errors = _VALIDATE.validate_metric_scoping(doc)
+
+    assert any(error.startswith("[Scope]") and "'quantity'" in error for error in errors)
+
+
+def test_dataset_scoped_metric_count_star_references_no_field() -> None:
+    doc = _orders_with(metrics=[{"name": "n", "expression": _ds_expr("COUNT(*)")}])
+
+    assert _VALIDATE.validate_metric_scoping(doc) == []
+
+
+def test_dataset_scoped_metric_scoping_skips_dialects_sqlglot_cannot_parse() -> None:
+    doc = _orders_with(
+        metrics=[{"name": "total", "expression": _ds_expr("SUM(orders.amount)", "MDX")}],
+    )
+
+    assert _VALIDATE.validate_metric_scoping(doc) == []
+
+
+def test_qualified_dataset_scoped_metric_fails_document_validation(core_schema, offline) -> None:
+    # Conformance test for the qualified-reference error case, per the dev@ossie
+    # "[DISCUSS] Dataset-scoped metrics" thread: a qualified reference in a
+    # dataset-scoped metric is a hard error (not a warning), so the whole
+    # document fails validation.
+    orders = {
+        "name": "orders",
+        "source": "db.s.orders",
+        "metrics": [{"name": "total", "expression": _ds_expr("SUM(orders.amount)")}],
+    }
+
+    errors = _VALIDATE.validate_document(_document([orders, _CUSTOMERS], []), core_schema)
+
+    scope_errors = [error for error in errors if error.startswith("[Scope]")]
+    assert scope_errors
+    assert all(not isinstance(error, _VALIDATE.ValidationWarning) for error in scope_errors)
