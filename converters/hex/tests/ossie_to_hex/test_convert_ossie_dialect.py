@@ -38,6 +38,7 @@ def ctx() -> ExportContext:
         (OssieDialect.BIGQUERY, "bigquery"),
         (OssieDialect.DATABRICKS, "databricks"),
         (OssieDialect.SNOWFLAKE, "snowflake"),
+        (OssieDialect.TRINO, "trino"),
     ],
 )
 def test_maps_sql_dialect(
